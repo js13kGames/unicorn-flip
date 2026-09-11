@@ -1,0 +1,692 @@
+<!DOCTYPE html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1,user-scalable=no">
+<title>UNICORN FLIP</title>
+<style>
+html,body{margin:0;background:#0a0a1a;overflow:hidden;height:100%}
+body{display:flex;align-items:center;justify-content:center}
+canvas{display:block;margin:auto;touch-action:none;image-rendering:pixelated}
+</style></head><body>
+<canvas id=c width=480 height=300></canvas>
+<script>
+const c=document.getElementById('c'),x=c.getContext('2d');
+let RM=0;try{RM=matchMedia('(prefers-reduced-motion: reduce)').matches?1:0}catch(e){}
+function fit(){const s=Math.min(innerWidth/480,innerHeight/300);c.style.width=480*s+'px';c.style.height=300*s+'px'}
+onresize=fit;fit();
+
+// js13k rule: all games share one origin, so the key must be namespaced (and never .clear()).
+// localStorage also throws outright in a sandboxed iframe — never let that kill the script.
+const KEY='unicornFlip13k.best',KEYB='unicornFlip13k.badge',KEYM='unicornFlip13k.mute',KEYP='unicornFlip13k.pace';
+const BADGE=[[1,'CLEAR','reach the end of the rainbow'],
+             [2,'NO HIT','reach the end with all 5 lives'],
+             [4,'10 PERFECT','land 10 PERFECT grazes in one run'],
+             [8,'CHAIN 15','build a 15-graze combo'],
+             [16,'13312','counter stop — score '+13312]];
+function ldBest(){try{const v=+localStorage[KEY];return Number.isFinite(v)&&v>0&&v<1e9?Math.floor(v):0}catch(e){return 0}}
+function svBest(v){try{localStorage[KEY]=v}catch(e){}}
+function ldNum(k){try{const v=+localStorage[k];return Number.isFinite(v)&&v>0?v|0:0}catch(e){return 0}}
+function svNum(k,v){try{localStorage[k]=v}catch(e){}}
+// The best run's score-per-second curve, replayed as a pace target. Racing the
+// number you already set is what turns one more go into ten more goes.
+function ldPace(){try{const v=localStorage[KEYP];return v?v.split(',').map(Number):null}catch(e){return null}}
+function svPace(){try{localStorage[KEYP]=pace.slice(0,900).join(',')}catch(e){}}
+function earn(b){if(!(badges&b)){badges|=b;svNum(KEYB,badges);pop('★ BADGE UNLOCKED','#ffd54a',15)}}
+
+// ── audio: one context, two-voice synth (melody + soft bass), looping ──
+let A,mT=0,mI,mTempo=140;
+function snd(f,d,t,v){if(!A||mute)return;const o=A.createOscillator(),g=A.createGain();
+ o.type=t||'square';o.frequency.value=f;g.gain.value=v||.08;
+ o.connect(g);g.connect(A.destination);
+ g.gain.exponentialRampToValueAtTime(.001,A.currentTime+d);
+ o.start();o.stop(A.currentTime+d)}
+// A four-bar progression (I - V - vi - IV) played by bass, pad, lead and drums.
+// The arrangement thickens as you climb through the skies and the tempo lifts when
+// you are down to your last lives, so the music reports the run back to you.
+const CHORD=[[0,4,7],[7,11,14],[9,12,16],[5,9,12]],LEAD=[0,2,1,2,0,1,2,1];
+function hz(semi){return 261.63*Math.pow(2,semi/12)}
+function setTempo(ms){if(ms!=mTempo){mTempo=ms;if(mI){clearInterval(mI);mI=setInterval(music,ms)}}}
+function music(){
+ if(!A||mute)return;
+ const playing=st=='play',z=playing?zoneN:0,
+       ch=CHORD[(mT>>3)&3],s=mT&7,
+       sf=slow>0?.5:1;                     // the whole arrangement drops an octave inside a graze
+ // the arrangement bends for danger AND for the final approach to the counter stop
+ setTempo(playing?(lives<=2||medal>=RANK.length-1?112:prog2()>0?124:140):150);
+ if(s==0||s==4)snd(hz(ch[0]-24)*sf,.42,'sine',.030);            // bass on the downbeats
+ if(s==0)for(const t of ch)snd(hz(t-12)*sf,.55,'triangle',.011); // chord pad, once a bar
+ let m=ch[LEAD[s]]+12;
+ if(z>=2&&(s==3||s==7))m+=12;                                    // lead lifts an octave later on
+ snd(hz(m)*sf,.15,z>=3?'square':'triangle',z>=3?.026:.032);
+ if(playing){
+  if(s==0||s==4)snd(70,.12,'sine',.05);                          // kick
+  if(s==2||s==6)snd(190,.06,'square',.022);                      // snare
+  if(z>=1)snd(3200,.02,'square',s&1?.006:.012);                  // hats from the second sky
+  if(z>=2&&s==6)snd(hz(ch[2]+12)*sf,.18,'sine',.018);            // counter-melody
+  if(storm>0&&(s&1)==0)snd(hz(ch[s>>1&2]+24)*sf,.1,'sine',.02);  // storm sparkle
+ }
+ mT++
+}
+
+// ── state ──
+let y,vy,dir,obs,item,trail,pfx,score,dist,st,fc,hue,glow,shake,combo;
+let lives,inv,storm,stormN,bannerT,bTxt,bCol,shield,medal,won,zoneT,zoneN,nb,blink;
+let nStar,nItem,nGate,mxCombo,md,lockT;  // run stats + a lock so the result screen is readable
+let slow,pops,nPerf,nGraze,mult,fadeAt,path,psi,pace,paceRef;         // dilation, labels, PERFECT count, grazes, x2 timer
+const TIER=['NEAR','GREAT','PERFECT'],TCOL=['#9fe8ff','#ffd54a','#ff6fae'];
+let best=ldBest(),badges=ldNum(KEYB),mute=ldNum(KEYM)?1:0;
+const ZONES=['MEADOW SKY','CLOUD PEAKS','STARLIGHT REACH',"RAINBOW'S END"];
+// threshold, name, colour ('' = cycle through the rainbow)
+const RANK=[[500,'BRONZE FLYER','#cd8032'],
+            [900,'SILVER FLYER','#c0c0c0'],
+            [1400,'GOLD FLYER','#ffd700'],
+            [2200,'RAINBOW FLYER',''],
+            [3600,'PRISM FLYER',''],
+            [5600,'AURORA FLYER',''],
+            [8400,'COMET FLYER',''],
+            [11000,'ALMOST THERE',''],
+            [13312,'COUNTER STOP','']];
+function rankCol(i){return i<1?'#ffd54a':RANK[i-1][2]||`hsl(${fc*6%360},95%,68%)`}
+const WIN_DIST=3600,MAXS=13312;   // 13,312 = the js13k size limit, and the score cap
+// ── TUNABLES (swept in the harness; do not reflow this line, the sweeper rewrites it) ──
+const IMP=3,GRV=.18,VMAX=5.5,GH0=125,GH1=80,SPD0=3,SPD1=4.9,SPAN0=240,SPAN1=300;
+// difficulty rides on DISTANCE (time survived), never on score.
+// score climbs fast when you play well, so tying difficulty to it punished skill.
+function prog(){return Math.min(1,dist/2400)}
+// BEYOND: past the rainbow's end the difficulty keeps climbing for another 90 seconds.
+// Without this the endless run never got harder and turned into a war of attrition.
+function prog2(){return dist<=WIN_DIST?0:Math.min(1,(dist-WIN_DIST)/5400)}
+function gateSpan(){return SPAN0+(SPAN1-SPAN0)*prog()+30*prog2()}
+function reset(){
+ y=150;vy=0;dir=1;obs=[];item=[];trail=[];pfx=[];score=0;dist=0;fc=0;hue=0;glow=0;shake=0;combo=0;
+ lives=5;inv=90;blink=false;storm=0;stormN=120;bannerT=0;bTxt='';bCol='';shield=0;medal=0;won=false;nb=false;zoneN=0;zoneT=90;
+ nStar=0;nItem=0;nGate=0;mxCombo=0;md=0;lockT=0;slow=0;pops=[];nPerf=0;nGraze=0;mult=0;fadeAt=0;path=[];psi=6;pace=[];paceRef=ldPace();
+ st='play';
+ if(!mI)mI=setInterval(music,mTempo);
+ for(let i=0;i<4;i++)mkObs(600+i*240)
+}
+function pop(t,c,sz){if(st=='demo')return;pops.push({t,c,s:sz||14,x:118,y:y-6,l:42})}   // attract mode must not litter the title card
+function burst(px,py,n,h){
+ for(let i=0;i<n;i++){const a=Math.random()*7;
+  pfx.push({x:px,y:py,vx:Math.cos(a)*3,vy:Math.sin(a)*3,l:20,h:h||Math.random()*360})}
+}
+function mkObs(px){
+ const p=prog(),gh=GH0+(GH1-GH0)*p-14*prog2();
+ const gy=30+Math.random()*(240-gh);        // gap stays fully on screen, 30px margin top & bottom
+ const mv=dist>1500&&Math.random()<.35+.3*prog2();   // drifting gates only in the back half
+ obs.push({x:px,gy,gh,p:0,mv,mvA:Math.random()*7,gy0:gy});
+ mkItem(px,gy,gh)
+}
+// STAR 0 / GEM 1 / PRISM 2 / HEART 3.
+// Every kind is ALWAYS worth taking — a gem you cannot use pays points instead —
+// so nothing has to be suppressed and the mix stays even across a run.
+function mkItem(px,gy,gh){
+ const cy=gy+gh/2,r=Math.random();
+ let k;
+ if(r<.38)k=0;else if(r<.50)k=1;else if(r<.60)k=2;else if(r<.68)k=3;else return; // 32% empty
+ if(k==2&&dist<300)k=0;      // the x2 only makes sense once scoring is rolling
+ if(k==3&&dist<400)k=0;
+ if(k==0){ // ~half sit on an edge line: taking one means grazing for it
+  const e=dist>420&&Math.random()<.5;
+  item.push({x:px+13,y:e?(Math.random()<.5?gy+11:gy+gh-11):cy,a:1,k:0,e});return
+ }
+ item.push({x:px+30,y:cy,a:1,k})
+}
+function banner(t,c,f){bannerT=f||80;bTxt=t;bCol=c||''}
+function add(n){score+=mult>0?n*2:n}   // PRISM doubles everything you earn by playing
+function flip(){
+ if(!A){try{A=new(window.AudioContext||window.webkitAudioContext)()}catch(e){}}
+ if(A&&A.state=='suspended')A.resume();
+ if(st=='pause'){resume();return}
+ if(fc<lockT)return;                       // hold the result on screen for a beat
+ if(st=='title'||st=='demo'||st=='over'||st=='max'){reset();return}
+ if(st=='win'){st='play';return}
+ doFlip()
+}
+function doFlip(){dir=-dir;vy=dir*IMP;snd(dir>0?260:390,.08)}
+// ATTRACT MODE: the title screen is a live game playing itself. One frame of
+// lookahead per gate is enough to make it read as a competent player, and it
+// doubles as the tutorial — you watch the rules before you touch anything.
+let dCool=0;
+function demoAI(){
+ if(dCool>0){dCool--;return}
+ let o=null,bx=1e9;
+ for(const g of obs)if(!g.p&&g.x>50&&g.x<bx){bx=g.x;o=g}
+ const t=o?o.gy+o.gh/2:150,k=o?Math.max(1,Math.min(60,(o.x-70)/3.6|0)):18;
+ const sim=f=>{let Y=y,V=vy,D=dir,p=0;if(f){D=-D;V=D*IMP}
+  for(let i=0;i<k;i++){V=Math.max(-VMAX,Math.min(VMAX,V+D*GRV));Y+=V;
+   if(Y<14){Y=14;V=2.5;p+=400}if(Y>286){Y=286;V=-2.5;p+=400}}
+  return Math.abs(Y-t)+p};
+ if(sim(1)<sim(0)-2){doFlip();dCool=5}
+}
+function startDemo(){reset();st='demo';lives=5;inv=90}
+addEventListener('pointerdown',e=>{e.preventDefault();flip()});
+addEventListener('blur',()=>pause());   // tabbing away should not cost you a run
+addEventListener('keydown',e=>{
+ // Some input stacks deliver keydown with an empty e.code (observed in the wild),
+ // so never rely on code alone — fall back to e.key.
+ const c=e.code||'',k=(e.key||'').toLowerCase(),
+       is=(cc,kk)=>c==cc||k==kk;
+ if(is('KeyP','p')||is('Escape','escape')){e.preventDefault();st=='pause'?resume():pause();return}
+ if(is('KeyR','r')){e.preventDefault();if(st!='title'&&st!='demo')reset();return}
+ if(is('KeyM','m')){e.preventDefault();mute^=1;svNum(KEYM,mute);return}
+ if(is('KeyC','c')){e.preventDefault();if(st=='over'||st=='win'||st=='max')doCopy();return}
+ // CORE SPEC: every plausible flip key works, not just Space
+ if(is('Space',' ')||k=='spacebar'||is('ArrowUp','arrowup')||is('ArrowDown','arrowdown')
+    ||is('KeyW','w')||is('KeyS','s')){e.preventDefault();flip()}
+});
+// title state: every variable the draw path touches must already hold a safe value
+y=150;vy=0;dir=1;st='title';obs=[];item=[];trail=[];pfx=[];score=0;dist=0;fc=0;
+combo=0;glow=0;shake=0;lives=5;inv=0;blink=false;storm=0;stormN=120;bannerT=0;bTxt='';bCol='';shield=0;medal=0;won=false;nb=false;zoneN=0;zoneT=0;hue=0;
+nStar=0;nItem=0;nGate=0;mxCombo=0;md=0;lockT=0;slow=0;pops=[];nPerf=0;nGraze=0;mult=0;fadeAt=0;path=[];psi=6;pace=[];paceRef=ldPace()
+
+function pause(){if(st!='play')return;st='pause';clearInterval(mI);mI=0}
+function resume(){if(st!='pause')return;st='play';if(!mI)mI=setInterval(music,mTempo)}
+function record(){nb=score>best;if(nb){best=score;svBest(best);if(st!='demo')svPace()}}
+function die(){
+ if(st=='demo'){startDemo();return}
+ st='over';record();lockT=fc+45;fadeAt=fc;
+ snd(120,.4,'sawtooth');shake=14;burst(70,y,18);
+ clearInterval(mI);mI=0
+}
+// unified hit handling: shields you via invincibility/rainbow-storm, costs a life otherwise
+function hit(){
+ if(inv>0||storm>0)return;
+ if(shield>0){shield=0;inv=60;blink=true;snd(700,.15,'sine',.07);burst(70,y,14,190);return}
+ lives--;
+ if(lives<=0){die();return}
+ inv=90;blink=true;shake=8;combo=0;
+ snd(180,.25,'square',.08);burst(70,y,10)
+}
+function update(){
+ if(st=='pause')return;   // frozen: fc drives both the animation and the result lock
+ fc++;
+ shake=shake>.4?shake*.86:0;   // must tick outside the play guard: the result screen shook forever
+ if(st=='demo')demoAI();
+ if(st!='play'&&st!='demo')return;
+ if(inv>0)inv--;
+ const ts=slow>0?.42:1;   // SUPERHOT-style dilation on a graze: the world slows, you do not
+ vy+=dir*GRV*ts;vy=Math.max(-VMAX,Math.min(VMAX,vy));y+=vy*ts;
+ if(y<14){y=14;vy=2.5;hit()}      // bounce away from the wall so you get room to recover
+ if(y>286){y=286;vy=-2.5;hit()}
+ trail.unshift({x:70,y});if(trail.length>22)trail.pop();
+ // sample the flight for the end-of-run picture; halve the resolution instead of growing
+ if(dist%psi==0){path.push(y);if(path.length>=600){path=path.filter((_,i)=>!(i&1));psi*=2}}
+ if(dist%60==0&&pace.length<900)pace.push(score);
+ dist++;if(dist%10==0)score++;
+ const zi=Math.min(3,Math.floor(dist/900));
+ if(zi!=zoneN){zoneN=zi;zoneT=110;snd(440,.3,'sine',.04)}
+ if(zoneT>0)zoneT--;
+ if(!won&&dist>=WIN_DIST){
+  if(st=='demo'){startDemo();return}
+  won=true;st='win';record();earn(1);if(lives>=5)earn(2);lockT=fc+60;fadeAt=fc;
+  snd(523,.3,'sine');snd(659,.35,'sine');snd(784,.5,'sine');
+  burst(240,150,50,45);burst(240,150,50,280);return
+ }
+ const spd=(SPD0+(SPD1-SPD0)*prog()+1.7*prog2())*ts;md+=spd;
+ for(let i=0;i<obs.length;i++){
+  const o=obs[i];
+  o.x-=spd;
+  if(o.mv){o.mvA+=.05*ts;o.gy=Math.max(20,Math.min(280-o.gh,o.gy0+Math.sin(o.mvA)*24))}
+  if(!o.p&&o.x<70){
+   o.p=1;add(2);nGate++;
+   const m=Math.min(y-o.gy,o.gy+o.gh-y);
+   if(m<15){
+    const t=m<5?2:m<9?1:0;                       // PERFECT / GREAT / NEAR
+    combo++;nGraze++;if(combo>mxCombo)mxCombo=combo;
+    if(t==2)nPerf++;
+    const gain=(t+1)*4+combo*(t+1);
+    add(gain);glow=1;
+    slow=Math.max(slow,[16,24,34][t]);           // tighter graze, longer dilation
+    pop(TIER[t]+'  +'+gain,TCOL[t],t==2?17:14);
+    snd(520+combo*24+t*180,.09,'sine',.06);burst(70,y,4+t*4,t==2?330:undefined)
+   }
+   else combo=0;
+   if(score>=stormN){stormN+=180;storm=100;banner('RAINBOW STORM!');snd(880,.5,'sine',.05);burst(240,150,40)}
+  }
+  if(inv<=0&&storm<=0&&o.x<90&&o.x>50&&(y-8<o.gy||y+8>o.gy+o.gh))hit()
+ }
+ // recycle off-screen gates AFTER the loop — mutating obs mid-iteration used to skip a gate for a frame
+ while(obs.length>1&&obs[0].x<-40){obs.shift();mkObs(obs[obs.length-1].x+gateSpan())}
+ for(const t of item){
+  t.x-=spd;
+  if(t.a&&Math.abs(t.x-70)<16&&Math.abs(t.y-y)<16){
+   t.a=0;
+   if(t.k==0){const v=t.e?25:10;add(v);nStar++;
+    pop((t.e?'EDGE STAR  +':'STAR  +')+v,'#fff28a',t.e?15:13);
+    snd(t.e?880:660,.1,'sine');burst(t.x,t.y,t.e?16:10,50)}
+   else if(t.k==1){nItem++;
+    if(shield>0){add(30);pop('GEM BONUS  +30','#7fe8ff',13)}else{shield=1;pop('SHIELD','#7fe8ff',13)}
+    snd(880,.2,'sine',.08);burst(t.x,t.y,14,190)}
+   else if(t.k==2){nItem++;mult=Math.min(900,mult+480);   // stacks instead of being wasted
+    pop('PRISM  ×2 SCORE','#c9a8ff',15);
+    snd(990,.22,'triangle',.07);snd(1320,.28,'sine',.05);burst(t.x,t.y,22,290)}
+   else{nItem++;
+    if(lives<5){lives++;pop('LIFE UP','#ff6fae',15)}else{add(50);pop('HEART BONUS  +50','#ff6fae',14)}
+    snd(740,.3,'sine',.08);burst(t.x,t.y,18,340)}
+  }
+ }
+ // pickups are never removed otherwise: on a long run the arrays grew without bound
+ item=item.filter(t=>t.a&&t.x>-30);
+ if(mult>0)mult--;
+ if(st=='demo'){if(score>MAXS)score=0}
+ else{
+ if(nPerf>=10)earn(4);
+ if(mxCombo>=15)earn(8);
+ if(score>=MAXS){                       // COUNTER STOP — the true ending
+  score=MAXS;st='max';medal=RANK.length;record();earn(16);lockT=fc+90;fadeAt=fc;shake=10;
+  for(let i=0;i<8;i++)burst(240,150,26,i*45);
+  snd(523,.5,'sine');snd(784,.6,'sine');snd(1047,.9,'sine');
+  clearInterval(mI);mI=0;return
+ }
+ let mr=0;
+ for(let i=0;i<RANK.length;i++)if(score>=RANK[i][0])mr=i+1;
+ if(mr>medal){                                   // a rung was just cleared
+  for(let i=medal;i<mr;i++){
+   const last=i>=RANK.length-2;
+   banner(RANK[i][1],RANK[i][2],last?120:90);
+   burst(240,150,last?46:26,i*40);
+   snd(520+i*70,.3,'sine',.06);snd(780+i*90,.36,'triangle',.04)
+  }
+  shake=Math.max(shake,mr>=RANK.length-1?8:4)
+ }
+ medal=mr;
+ }
+ for(const p of pfx){p.x-=spd*.5;p.x+=p.vx*ts;p.y+=p.vy*ts;p.l--}
+ for(const q of pops)q.l--;
+ pops=pops.filter(q=>q.l>0);
+ if(slow>0)slow--;
+ pfx=pfx.filter(p=>p.l>0);
+ if(glow>0)glow-=.04;
+ if(storm>0)storm--;
+ if(bannerT>0)bannerT--
+}
+
+// ── draw ──
+function skyHue(){return st=='title'?285:330-150*Math.min(1,dist/WIN_DIST)}
+function sky(h){
+ const g=x.createLinearGradient(0,0,0,300);
+ g.addColorStop(0,`hsl(${h},55%,18%)`);
+ g.addColorStop(.55,`hsl(${(h+35)%360},65%,58%)`);
+ g.addColorStop(1,`hsl(${(h+75)%360},80%,85%)`);
+ x.fillStyle=g;x.fillRect(0,0,480,300)
+}
+function cloud(cx,cy,w,a){
+ x.fillStyle=`rgba(255,255,255,${a||.42})`;x.beginPath();
+ x.arc(cx,cy,w*.5,0,7);x.arc(cx-w*.3,cy+4,w*.35,0,7);x.arc(cx+w*.3,cy+4,w*.35,0,7);
+ x.fill()
+}
+function mountain(cx,base,h,c){
+ x.fillStyle=c;x.beginPath();x.moveTo(cx-70,base);x.lineTo(cx,base-h);x.lineTo(cx+70,base);x.fill()
+}
+function moon(){
+ x.fillStyle='#fff8e0';x.beginPath();x.arc(400,55,22,0,7);x.fill();
+ x.fillStyle='#0a0a1a';x.beginPath();x.arc(408,48,20,0,7);x.fill()
+}
+function starfield(){
+ if(st=='title'||zoneN>=2){ // the later, darker zones: twinkling stars
+  x.fillStyle='rgba(255,255,255,.7)';
+  for(let i=0;i<18;i++){
+   const sx=(i*97+fc*.2)%480,sy=(i*53)%150,tw=.4+Math.sin(fc*.1+i)*.3;
+   x.globalAlpha=tw;x.fillRect(sx,sy,2,2)
+  }
+  x.globalAlpha=1
+ }
+}
+// Three scrolling depths plus two sky effects. All of it is arithmetic — no assets,
+// no layers to load — which is most of why the sky can afford to look like this.
+function aurora(a){
+ for(let b=0;b<3;b++){
+  x.strokeStyle=`hsla(${(150+b*55+fc*.5)%360},92%,62%,${a})`;x.lineWidth=13;
+  x.beginPath();
+  for(let i=0;i<=16;i++)x.lineTo(i*30,38+b*17+Math.sin(i*.52+fc*.018+b*1.7)*15);
+  x.stroke()
+ }
+}
+function shooting(){
+ // one streak every few seconds, deterministic from the frame counter
+ const t=fc%420;
+ if(t>60)return;
+ const k=(fc/420|0)*137%360,sx=480-t*7.2,sy=18+k%70;
+ x.strokeStyle=`rgba(255,255,255,${Math.min(1,(60-t)/24)*.8})`;x.lineWidth=2;
+ x.beginPath();x.moveTo(sx,sy);x.lineTo(sx+26,sy-9);x.stroke()
+}
+function unicorn(px,py,d){
+ x.save();x.translate(px,py);x.rotate(vy*.03);
+ const gallop=Math.sin(fc*.35)*3;
+ x.strokeStyle='#e8e8e8';x.lineWidth=2; // galloping legs
+ x.beginPath();x.moveTo(-6,7);x.lineTo(-6+gallop,13);x.moveTo(6,7);x.lineTo(6-gallop,13);x.stroke();
+ x.strokeStyle='#4b3a6b';x.lineWidth=2;
+ x.fillStyle='#fff';x.beginPath();x.ellipse(0,0,16,10,0,0,7);x.fill();x.stroke();
+ x.beginPath();x.ellipse(14,-4*d,9,7,0,0,7);x.fill();x.stroke();
+ x.fillStyle='#ffd54a';x.beginPath();
+ x.moveTo(19,-9*d);x.lineTo(23,-17*d);x.lineTo(21,-8*d);x.fill();
+ // flowing rainbow mane
+ for(let i=0;i<3;i++){x.strokeStyle=`hsl(${(hue+i*40)%360},85%,65%)`;x.lineWidth=3;
+  x.beginPath();x.moveTo(8-i*2,-8*d);x.lineTo(2-i*3+Math.sin(fc*.2+i)*2,-2*d+i*3);x.stroke()}
+ x.fillStyle='#ff6fae';x.beginPath();x.ellipse(-14,2*d,7,4,.3,0,7);x.fill();
+ x.restore()
+}
+// The finished run, drawn as a single rainbow ribbon across the screen.
+// Every result card is therefore a picture of that specific flight, and no two match.
+function ribbon(a){
+ const n=path.length;
+ if(n<3)return;
+ x.globalAlpha=a;x.lineWidth=2.5;x.lineCap='round';
+ for(let i=0;i<n-1;i++){
+  x.strokeStyle=`hsl(${(i/n*320+hue)%360},92%,64%)`;
+  x.beginPath();
+  x.moveTo(10+i/(n-1)*460,path[i]);
+  x.lineTo(10+(i+1)/(n-1)*460,path[i+1]);
+  x.stroke()
+ }
+ x.globalAlpha=1;x.lineCap='butt'
+}
+// C on a result screen puts a one-line summary on the clipboard, ready to paste.
+function shareLine(){
+ return `UNICORN FLIP — ${score} pts · ${nGraze} grazes (${nPerf} PERFECT) · combo x${mxCombo} · ${(md/10|0)}m in ${tm()}${medal?' · '+RANK[medal-1][1]:''}${score>=MAXS?' · COUNTER STOP':''} — js13kGames 2026, 13KB`;
+}
+let copied=0;
+function doCopy(){try{navigator.clipboard.writeText(shareLine());copied=fc+120}catch(e){}}
+function nextBadge(){for(const b of BADGE)if(!(badges&b[0]))return b;return null}
+function fade(){return Math.min(1,(fc-fadeAt)/34)}   // ease the result in while the shake dies away
+function tm(){const t=dist/60|0;return (t/60|0)+':'+String(t%60).padStart(2,'0')}
+// two-column run summary, shared by the game-over screen
+function stats(y0){
+ const L=[['STARS',nStar],['ITEMS',nItem],['GATES',nGate],['DIST',(md/10|0)+'m']],
+       R=[['GRAZES',nGraze],['PERFECT',nPerf],['COMBO','x'+mxCombo],['TIME',tm()]];
+ x.font='12px monospace';
+ for(let i=0;i<4;i++){const yy=y0+i*19;
+  x.textAlign='left';x.fillStyle='#cbb8e8';x.fillText(L[i][0],104,yy);x.fillText(R[i][0],268,yy);
+  x.textAlign='right';x.fillStyle='#fff';x.fillText(L[i][1],228,yy);x.fillText(R[i][1],392,yy)}
+ x.textAlign='center'
+}
+function draw(){
+ x.save();
+ if(shake>0&&!RM)x.translate((Math.random()-.5)*shake,(Math.random()-.5)*shake);
+ sky(skyHue());
+ starfield();
+ // zone-specific backdrop: the journey visibly changes as you go
+ if(zoneN==1){const mx=(fc*.22)%640;
+  mountain(180-mx,300,90,'rgba(60,50,90,.5)');mountain(460-mx,300,120,'rgba(50,42,80,.5)');mountain(820-mx,300,104,'rgba(56,46,86,.5)')}
+ else if(zoneN==2){moon()}
+ else if(zoneN==3){ // foreshadow the finale with a distant rainbow glow
+  for(let i=0;i<4;i++){x.strokeStyle=`hsla(${i*70},85%,65%,.35)`;x.lineWidth=10;x.beginPath();x.arc(240,340,60+i*14,Math.PI,0);x.stroke()}
+ }
+ if(zoneN>=2)aurora(.16);
+ if(zoneN>=2)shooting();
+ // far layer: big, slow, faint — the sky gains depth for a handful of bytes
+ for(let i=0;i<3;i++)cloud(((fc*.13+i*210)%660)-90,44+i*58,104,.2);
+ for(let i=0;i<4;i++)cloud(((fc*.4+i*160)%600)-60,50+i*40,60);
+ // near layer: small, fast, in front of the gates is wrong, so keep it behind
+ for(let i=0;i<3;i++)cloud(((fc*.85+i*190)%620)-70,96+i*66,34,.55);
+ for(let i=0;i<trail.length-1;i++){
+  x.strokeStyle=`hsl(${(hue+i*16)%360},90%,60%)`;
+  x.lineWidth=8-i*.3;x.beginPath();
+  x.moveTo(trail[i].x-i*3,trail[i].y);x.lineTo(trail[i+1].x-(i+1)*3,trail[i+1].y);x.stroke();
+  if(combo>=5){ // DOUBLE RAINBOW: a second faint band appears at high combo
+   x.strokeStyle=`hsla(${(hue+i*16+140)%360},90%,65%,.6)`;x.lineWidth=4-i*.15;
+   x.beginPath();x.moveTo(trail[i].x-i*3,trail[i].y-6);x.lineTo(trail[i+1].x-(i+1)*3,trail[i+1].y-6);x.stroke()
+  }
+ }
+ hue=(hue+3)%360;
+ const gCol=['#fffbe8','#e8d9ff','#d9f5ff','#ffe0f0'][zoneN],gAcc=['#ffd9ec','#c9a8ff','#a8e8ff','#ffb8d9'][zoneN];
+ x.fillStyle=gCol;
+ for(const o of obs){
+  x.fillRect(o.x,0,26,o.gy);
+  x.fillRect(o.x,o.gy+o.gh,26,300-o.gy-o.gh);
+  x.fillStyle=gAcc;x.fillRect(o.x,o.gy-4,26,4);x.fillRect(o.x,o.gy+o.gh,26,4);
+  x.fillStyle=gCol
+ }
+ for(const t of item)if(t.a){
+  x.save();x.translate(t.x,t.y);
+  if(t.k==0){
+   // ringed star = sits on an edge line, worth 25 instead of 10
+   if(t.e){x.strokeStyle=`hsla(${(hue*2)%360},95%,70%,.9)`;x.lineWidth=2;
+    x.beginPath();x.arc(0,0,13,0,7);x.stroke()}
+   x.rotate(fc*.1);x.fillStyle='#fff28a';x.beginPath();
+   for(let i=0;i<5;i++){const a=i*2.5;x.lineTo(Math.cos(a)*8,Math.sin(a)*8);x.lineTo(Math.cos(a+.63)*3,Math.sin(a+.63)*3)}
+   x.fill()
+  }else if(t.k==1){
+   x.rotate(fc*.08);x.fillStyle='#7fe8ff';x.beginPath();
+   x.moveTo(0,-9);x.lineTo(7,0);x.lineTo(0,9);x.lineTo(-7,0);x.fill()
+  }else if(t.k==2){
+   x.rotate(Math.sin(fc*.06)*.45);                      // prism: a rainbow shard
+   for(let i=0;i<3;i++){x.fillStyle=`hsl(${(i*70+fc*4)%360},95%,68%)`;
+    x.beginPath();x.moveTo(0,-11);x.lineTo(10-i*3.3,8);x.lineTo(-10+i*3.3,8);x.fill()}
+  }else{
+   const b=1+Math.sin(fc*.15)*.09;x.scale(b,b);x.fillStyle='#ff6fae';
+   x.beginPath();x.arc(-4,-3,5,0,7);x.arc(4,-3,5,0,7);
+   x.moveTo(-9,-1);x.lineTo(0,10);x.lineTo(9,-1);x.fill()
+  }
+  x.restore()
+ }
+ for(const p of pfx){
+  x.fillStyle=`hsl(${p.h},90%,65%)`;x.globalAlpha=p.l/20;
+  x.fillRect(p.x-2,p.y-2,4,4)
+ }
+ x.globalAlpha=1;
+ // rainbow storm: celebratory expanding rings, and grants temporary invincibility
+ if(storm>0){
+  for(let i=0;i<6;i++){
+   x.strokeStyle=`hsla(${(hue+i*40)%360},90%,60%,.55)`;
+   x.lineWidth=6;x.beginPath();x.arc(240,150,40+i*20+((100-storm)*2),0,7);x.stroke()
+  }
+ }
+ if((st=='play'||st=='demo')&&(!blink||inv<=0||fc%6<3))unicorn(70,y,dir);
+ if(shield>0&&(st=='play'||st=='demo')){
+  x.strokeStyle='#7fe8ff';x.lineWidth=2;x.beginPath();x.arc(70,y,20,0,7);x.stroke()
+ }
+ if(slow>0&&(st=='play'||st=='demo')){
+  const k=slow/34;
+  x.fillStyle=`rgba(200,225,255,${k*.10})`;x.fillRect(0,0,480,300);
+  x.strokeStyle=`rgba(255,255,255,${k*.55})`;x.lineWidth=2;
+  x.beginPath();x.arc(70,y,20+(1-k)*36,0,7);x.stroke()
+ }
+ if(glow>0){
+  x.strokeStyle=`hsla(${hue},90%,65%,${glow})`;x.lineWidth=3;
+  x.beginPath();x.arc(70,y,18+((1-glow)*14),0,7);x.stroke()
+ }
+ // HUD — shadowed so it stays legible against any sky colour
+ x.shadowColor='rgba(10,10,26,.8)';x.shadowBlur=5;
+ for(const q of pops){
+  x.globalAlpha=Math.min(1,q.l/16);x.textAlign='left';
+  x.fillStyle=q.c;x.font='bold '+q.s+'px monospace';
+  x.fillText(q.t,q.x,q.y-(42-q.l)*.7)
+ }
+ x.globalAlpha=1;
+ if(st=='play'){
+  x.fillStyle='#fff';x.font='bold 20px monospace';x.textAlign='left';
+  x.fillText(score,12,26);
+  if(combo>1){x.fillStyle='#ffd54a';x.font='bold 13px monospace';x.fillText('COMBO x'+combo,12,44)}
+  if(mult>0){x.fillStyle='#c9a8ff';x.font='bold 13px monospace';x.fillText('×2  '+Math.ceil(mult/60)+'s',12,62)}
+  if(paceRef){
+   const pi=Math.min(paceRef.length-1,dist/60|0),d=score-paceRef[pi];
+   x.font='bold 13px monospace';x.fillStyle=d>=0?'#8cffa8':'#ff9aa2';
+   x.fillText((d>=0?'+':'')+d,104,26);
+   x.fillStyle='rgba(255,255,255,.45)';x.font='9px monospace';
+   x.fillText('vs BEST',104,38)
+  }
+ }
+ if(st=='play'){
+  for(let i=0;i<5;i++){
+   x.fillStyle=i<lives?'#ff6fae':'rgba(255,255,255,.25)';
+   x.beginPath();x.arc(458-i*18,20,6,0,7);x.fill()
+  }
+  // Phase 1 measures the way to the rainbow's end. After that the SAME meter becomes
+  // the rank gauge: nine equal segments, each one filling in with the colour of the rung
+  // you just earned, so the bar keeps visibly moving all the way to the counter stop.
+  const ph2=won,N=RANK.length,SW=240/N;
+  x.fillStyle='rgba(255,255,255,.25)';x.fillRect(120,12,240,5);
+  let f;
+  if(ph2){
+   const lo=medal?RANK[medal-1][0]:0,hi=medal<N?RANK[medal][0]:MAXS,
+         seg=Math.max(0,Math.min(1,(score-lo)/(hi-lo)));
+   f=Math.min(1,(medal+seg)/N);
+   for(let i=0;i<N;i++){
+    const x0=120+SW*i;
+    if(i<medal){x.fillStyle=RANK[i][2]||`hsl(${(fc*4+i*38)%360},95%,66%)`;x.fillRect(x0,12,SW-1,5)}
+    else if(i==medal){
+     x.globalAlpha=medal>=N-1?.72+Math.sin(fc*.2)*.28:1;   // the last rung breathes
+     x.fillStyle=rankCol(medal+1);x.fillRect(x0,12,(SW-1)*seg,5);x.globalAlpha=1
+    }
+    if(i)x.fillRect(x0-1,9,1,11)
+   }
+   x.fillStyle='rgba(255,255,255,.3)';
+   for(let i=1;i<N;i++)x.fillRect(120+SW*i-1,9,1,11)
+  }else{
+   f=Math.min(1,dist/WIN_DIST);
+   x.fillStyle=['#ffd9ec','#c9a8ff','#a8e8ff','#ffb8d9'][zoneN];
+   x.fillRect(120,12,240*f,5)
+  }
+  const nx=ph2&&medal<N?RANK[medal]:null;
+  x.textAlign='center';x.font='9px monospace';x.fillStyle='rgba(255,255,255,.68)';
+  x.fillText(ph2?(nx?'NEXT  '+nx[1]+'   '+(nx[0]-score):'COUNTER STOP'):
+    "RAINBOW'S END   "+Math.max(0,Math.ceil((WIN_DIST-dist)/60))+'s',240,29);
+  x.textAlign='left'
+ }
+ if(bannerT>0){
+  x.textAlign='center';x.font='bold 22px monospace';
+  x.globalAlpha=Math.min(1,bannerT/18);
+  x.fillStyle=bCol||`hsl(${hue},90%,72%)`;
+  x.fillText(bTxt,240,55);
+  x.globalAlpha=1
+ }
+ if(zoneT>0&&st=='play'){
+  x.textAlign='center';x.font='16px monospace';
+  x.fillStyle=`rgba(255,255,255,${Math.min(1,zoneT/40)})`;
+  x.fillText(ZONES[zoneN],240,150)
+ }
+ if(st=='pause'){
+  x.fillStyle='rgba(10,10,26,.85)';x.fillRect(0,0,480,300);
+  x.textAlign='center';x.fillStyle='#fff';x.font='bold 22px monospace';
+  x.fillText('PAUSED',240,36);
+  const rows=[['#fff28a','★','STAR','+10   —   ringed, on an edge line: +25'],
+              ['#7fe8ff','◆','GEM','shield — blocks one hit (bonus if held)'],
+              ['#c9a8ff','▲','PRISM','×2 score for 8 seconds'],
+              ['#ff6fae','♥','HEART','restores one life (bonus at 5)'],
+              ['#e8d9ff','▮','GRAZE','skim a gate edge — time slows, COMBO climbs'],
+              ['#ffd54a','◉','STORM','score milestone — brief invincibility']];
+  for(let i=0;i<6;i++){const r=rows[i],yy=62+i*21;
+   x.textAlign='center';x.fillStyle=r[0];x.font='bold 15px monospace';x.fillText(r[1],46,yy);
+   x.textAlign='left';x.fillStyle='#fff';x.font='bold 12px monospace';x.fillText(r[2],64,yy);
+   x.fillStyle='#cbb8e8';x.font='12px monospace';x.fillText(r[3],132,yy)}
+  x.textAlign='center';x.fillStyle='#ffe6f7';x.font='12px monospace';
+  x.fillText('TAP / SPACE / ↑ ↓ / W / S   —   flip gravity',240,204);
+  x.fillText('P or ESC  resume     R  restart     M  sound '+(mute?'off':'on'),240,222);
+  x.fillStyle='#9fe8ff';x.font='11px monospace';
+  x.fillText('graze tiers:  NEAR · GREAT · PERFECT  —  tighter = slower time',240,240);
+  x.fillStyle='#ffd54a';x.font='bold 12px monospace';
+  x.fillText('GOAL: reach the end of the rainbow — then chase '+MAXS,240,260);
+  x.fillStyle='#cbb8e8';x.font='11px monospace';
+  x.fillText('progress '+Math.min(100,Math.round(dist/WIN_DIST*100))+'%   ·   score '+score+'   ·   best '+best,240,280)
+ }
+ if(st=='title'||st=='demo'){
+  // veil the attract game so the card stays readable without hiding the action
+  x.fillStyle='rgba(10,6,22,.46)';x.fillRect(0,0,480,300);
+  x.textAlign='center';x.fillStyle='#fff';x.font='bold 30px monospace';
+  x.fillText('UNICORN FLIP',240,74);
+  x.font='10px monospace';x.fillStyle='rgba(255,255,255,.5)';
+  x.fillText('ATTRACT MODE — the game is playing itself',240,96);
+  x.font='15px monospace';x.fillStyle='#ffe6f7';
+  x.font='15px monospace';x.fillStyle='#ffe6f7';
+  x.fillText('tap / space to flip gravity',240,186);
+  x.fillText('5 lives · graze gates to slow time',240,206);
+  const sg=x.createLinearGradient(0,198,0,300);
+  sg.addColorStop(0,'rgba(14,5,24,0)');sg.addColorStop(1,'rgba(14,5,24,.62)');
+  x.fillStyle=sg;x.fillRect(0,198,480,102);
+  x.font='bold 15px monospace';x.fillStyle='#ffd54a';
+  x.fillText('BEST '+best,240,232);
+  x.fillStyle='#d9b8ff';x.font='bold 11px monospace';
+  x.fillText('COUNTER STOP AT '+MAXS,240,250);
+  // badge row: five separate reasons to start another run
+  x.font='10px monospace';x.textAlign='left';
+  const sep='  ·  ';let bw=0;
+  for(let i=0;i<5;i++){bw+=x.measureText(BADGE[i][1]).width;if(i<4)bw+=x.measureText(sep).width}
+  let bx=240-bw/2;
+  for(let i=0;i<5;i++){
+   x.fillStyle=(badges&BADGE[i][0])?'#ffd54a':'rgba(255,255,255,.34)';
+   x.fillText(BADGE[i][1],bx,268);bx+=x.measureText(BADGE[i][1]).width;
+   if(i<4){x.fillStyle='rgba(255,255,255,.3)';x.fillText(sep,bx,268);bx+=x.measureText(sep).width}
+  }
+  x.textAlign='center';x.fillStyle='#bda8cf';x.font='11px monospace';
+  x.fillText('P or ESC  rules      M  sound '+(mute?'off':'on'),240,286)
+ }
+ if(st=='max'){
+  // COUNTER STOP — the true ending, named after the size limit that shaped the game
+  x.fillStyle='rgba(6,4,16,.93)';x.fillRect(0,0,480,300);
+  x.globalAlpha=fade();
+  // one dark base, then rings drawn at low alpha: no second veil to mute them
+  for(let i=0;i<11;i++){x.strokeStyle=`hsla(${(fc*3+i*36)%360},95%,66%,.34)`;x.lineWidth=10;
+   x.beginPath();x.arc(240,150,40+i*24+Math.sin(fc*.04+i)*5,0,7);x.stroke()}
+  x.textAlign='center';x.fillStyle='#fff';x.font='bold 22px monospace';
+  x.globalAlpha=1;ribbon(.30);x.globalAlpha=fade();
+  x.fillText('COUNTER STOP',240,40);
+  x.font='bold 42px monospace';x.fillStyle=`hsl(${fc*6%360},95%,68%)`;
+  x.fillText(MAXS,240,84);
+  x.font='bold 12px monospace';x.fillStyle='#e2ccff';
+  x.fillText('the js13k size limit — reached',240,105);
+  stats(130);
+  x.fillStyle=`hsl(${fc*7%360},95%,70%)`;x.font='bold 14px monospace';
+  x.fillText('* '+RANK[RANK.length-1][1]+' *',240,232);
+  if(fc>=lockT){x.fillStyle=fc<copied?'#8cffa8':'#ffe6f7';x.font='12px monospace';
+   x.fillText(fc<copied?'copied to clipboard':'tap to fly again   ·   C copy result',240,262)}
+  x.globalAlpha=1
+ }
+ if(st=='win'){
+  x.globalAlpha=fade();
+  x.fillStyle='rgba(10,10,26,.4)';x.fillRect(0,0,480,300);
+  for(let i=0;i<7;i++){x.strokeStyle=`hsl(${i*50},90%,60%)`;x.lineWidth=8;x.beginPath();x.arc(240,330,90+i*10,Math.PI,0);x.stroke()}
+  x.fillStyle='#2a2a2a';x.beginPath();x.moveTo(212,272);x.lineTo(268,272);x.lineTo(258,292);x.lineTo(222,292);x.fill();
+  x.fillStyle='#ffd700';for(let i=0;i<5;i++){x.beginPath();x.arc(220+i*8,265,4,0,7);x.fill()}
+  x.textAlign='center';x.fillStyle='#fff';x.font='bold 18px monospace';
+  x.fillText('YOU REACHED THE',240,45);x.fillText('END OF THE RAINBOW',240,65);
+  x.font='bold 30px monospace';x.fillStyle='#ffd54a';x.fillText(score,240,105);
+  x.font='13px monospace';x.fillStyle='#ffe6f7';
+  x.fillText((nb?'NEW BEST!':'best '+best)+'   ·   tap to keep flying',240,128);
+  if(medal>0){x.fillStyle=rankCol(medal);x.font='bold 14px monospace';
+   x.fillText('* '+RANK[medal-1][1]+' *',240,150)}
+  x.font='12px monospace';x.fillStyle='#cbb8e8';
+  x.fillText('★ '+nStar+'   GRAZE '+nGraze+'   PERFECT '+nPerf+'   COMBO x'+mxCombo+'   '+tm(),240,174);
+  x.globalAlpha=1
+ }
+ if(st=='over'){
+  x.globalAlpha=fade();
+  x.fillStyle='rgba(10,10,26,.82)';x.fillRect(0,0,480,300);
+  x.globalAlpha=1;ribbon(fade()*.24);x.globalAlpha=fade();
+  x.textAlign='center';x.fillStyle='#fff';x.font='bold 24px monospace';
+  x.fillText(won?'RUN COMPLETE':'GAME OVER',240,44);
+  x.font='bold 40px monospace';x.fillStyle='#ffd54a';
+  x.fillText(score,240,88);
+  // best was already updated by record(), so read the flag it left, not score>best
+  x.font='bold 13px monospace';x.fillStyle=nb?'#ff6fae':'#ffe6f7';
+  x.fillText(nb?'★ NEW BEST ★':'best '+best+'   ('+(score-best)+')',240,110);
+  stats(136);
+  if(medal>0){x.fillStyle=rankCol(medal);
+   x.font='bold 15px monospace';x.fillText('* '+RANK[medal-1][1]+' *',240,232)}
+  const nb2=nextBadge();
+  if(nb2){x.fillStyle='#9fe8ff';x.font='11px monospace';
+   x.fillText('NEXT BADGE — '+nb2[1]+':  '+nb2[2],240,256)}
+  if(fc>=lockT){x.fillStyle=fc<copied?'#8cffa8':'#ffe6f7';x.font='12px monospace';
+   x.fillText(fc<copied?'copied to clipboard':'tap to retry   ·   R restart   ·   C copy result',240,276)}
+  x.globalAlpha=1
+ }
+ x.shadowBlur=0;
+ x.restore()
+}
+// fixed 60Hz logic step, decoupled from the display refresh rate.
+// without this the game ran 2x on a 120Hz monitor and 2.4x on 144Hz.
+const STEP=1e3/60;let acc=0,last=0;
+function loop(ts){
+ requestAnimationFrame(loop);
+ const nw=typeof ts=='number'?ts:performance.now();
+ if(!last)last=nw-STEP;
+ let dt=nw-last;last=nw;
+ if(dt<0)dt=0;if(dt>250)dt=250;   // tab returning from background must not fast-forward
+ acc+=dt;
+ let n=0;
+ while(acc>=STEP&&n<4){update();acc-=STEP;n++}
+ if(acc>=STEP)acc=0;              // too slow to keep up: drop the backlog instead of spiralling
+ draw()
+}
+startDemo();
+requestAnimationFrame(loop);
+</script>
+</body></html>
